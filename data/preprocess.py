@@ -1,16 +1,13 @@
 import argparse
 import json
 import logging
-import openai # type: ignore
+import openai  # type: ignore
 import os
-import pandas as pd # type: ignore
-import pprint as pp
+import pandas as pd  # type: ignore
 import torch
 import transformers
 
-from retrying import retry # type: ignore
-from typing import Optional
-
+from typing import Optional, List
 
 
 logger = logging.getLogger(__name__)
@@ -20,10 +17,9 @@ logging.basicConfig(
 )
 
 
-
-
 class ModelClient:
     """ base class for interacting with Model API """
+
 
 class LlamaClient(ModelClient):
     def __init__(self, model_path="CodeLlama-7b"):
@@ -46,10 +42,10 @@ class GPTClient(ModelClient):
         super().__init__()
         self.client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
-    def send_and_get_response(self, query: str):
+    def send_and_get_response(self, query: str) -> str:
         try:
             response = self.client.chat.completions.create(
-                messages = [
+                messages=[
                     {
                         "role": "user",
                         "content": query,
@@ -63,6 +59,38 @@ class GPTClient(ModelClient):
         return response.choices[0].message.content
 
 
+class Query:
+
+    QUERY_FORMAT = {
+        "1": "Control: ",
+        "2": "Statement: ",
+        "3": "Implementation Guideline: ",
+        "4": (
+                "The information above is for a 'cloud control,' which is a "
+                "type of security measure taken to solve certain issues "
+                "relating to cloud security. A user is alerted with a security "
+                "risk relating to the control above, and wants to ask an LLM "
+                "for help. Create a set of questions and answers that can help "
+                "train the LLM. Give response in json format, with the keys "
+                "starting off with: question1, answer1, question2, answer2, etc."
+            )
+    }
+
+    def __init__(self, control: str, statement: str, implementation: str):
+        self.control = control
+        self.statement = statement
+        self.implementation = implementation
+
+    def create_query(self) -> str:
+        query_format = self.QUERY_FORMAT
+        query = (
+            f"{query_format['1']}{self.control}\n"
+            f"{query_format['2']}{self.statement}\n"
+            f"{query_format['3']}{self.implementation}\n{query_format['4']}"
+        )
+        return query
+
+
 class TrainingData:
     """ Class to load and preprocess the training data """
 
@@ -72,7 +100,7 @@ class TrainingData:
 
     @property
     def data(self):
-        return self._data 
+        return self._data
 
     # Load the json file
     def load_data(self):
@@ -87,34 +115,57 @@ class TrainingData:
             logger.error(f"Error in loading data: {e}")
             raise
 
-    def get_dataframe(self, allowed_controls: list, cc: ModelClient) -> pd.DataFrame:
-        df = pd.DataFrame(columns=['input', 'output',])
-
-        controls = []
+    def get_queries(self, allowed_controls: Optional[List]) -> List[str]:
+        queries = []
 
         for group in self._data['catalog']['groups']:
             print(group['id'])
-            if (group['id'] not in allowed_controls): # for testing purposes, update later
-                continue 
+            # for testing purposes, update later
+            if allowed_controls and group['id'] not in allowed_controls:
+                continue
             for control in group['controls']:
-                controls.append({
-                    'title': str(control['title']),
-                    'statement': str(control['parts'][0]['prose']),
-                    'implementation': str(control['parts'][1]['prose'])
-                })
-        
-        # print(controls[0]['title'])
-        # print(controls[0]['statement'])
-        # print(controls[0]['implementation'])
+                query = Query(
+                    control['title'],
+                    control['parts'][0]['prose'],
+                    control['parts'][1]['prose']
+                )
+                queries.append(query.create_query())
 
-        for control in controls:
-            query = "to do"
-            json_response = json.load(send_and_get_response(cc, query))
-            # df.append({'input':json_response['question'], 'output':json_response['answer']}, ignore_index=True)
-        
+        return queries
+
+    def create_dataset(
+        self, allowed_controls: Optional[List], cc: ModelClient
+    ) -> pd.DataFrame:
+        df = pd.DataFrame(columns=['input', 'output'])
+
+        queries = self.get_queries(allowed_controls)
+
+        for query in queries:
+            try:
+                json_response = json.loads(send_and_get_response(cc, query))
+
+                questions = [
+                    key for key in json_response.keys()
+                    if key.startswith('question')
+                ]
+
+                logger.info(f"Response: {json_response}")
+
+                for question in questions:
+                    result = {
+                        'input': [json_response[question]],
+                        'output': [json_response[question.replace('question', 'answer')]]
+                    }
+                    logger.info(f"Got result: {result}")
+                    df = pd.concat(
+                        [df, pd.DataFrame(result)], ignore_index=False
+                    )
+            except Exception as e:
+                logger.error(
+                    f"Error in sending query: {query}: {e}"
+                )
+
         return df
-            
-
 
 
 def send_and_get_response(cc: ModelClient, query: str) -> Optional[str]:
@@ -124,14 +175,22 @@ def send_and_get_response(cc: ModelClient, query: str) -> Optional[str]:
         logger.error(f"Error in getting response from Model: {e}", exc_info=True)
         return None
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Arguments')
     parser.add_argument(
-        '--model', 
-        type=str, 
-        choices=['gpt', 'llama'], 
+        '--model',
+        type=str,
+        choices=['gpt', 'llama'],
         help='Specify the model type (gpt or llama)',
         default='gpt'
+    )
+
+    parser.add_argument(
+        '--fname',
+        type=str,
+        help='CSV file name to save the data to',
+        default='dataset.xml'
     )
 
     args = parser.parse_args()
@@ -140,32 +199,8 @@ if __name__ == "__main__":
     td.load_data()
     if args.model == "llama":
         cc = LlamaClient()
-    else: 
+    else:
         cc = GPTClient()
 
-    # td.get_dataframe(['IVS'], cc)
-
-    query = """
-Control: Infrastructure and Virtualization Security Policy and Procedures
-Statement: Establish, document, approve, communicate, apply, evaluate and maintain
-policies and procedures for infrastructure and virtualization security. Review
-and update the policies and procedures at least annually.
-
-
-The information above is for a "cloud control," which is a type of security measure taken to solve certain issues relating to cloud security. A user is alerted with a security risk relating to the control above, and wants to ask an LLM for help. Create a single question and answer relating to the control above and this statement: Governance and control VM lifecycle management. give response in json format, and both the question and answer should be simple such as a paragraph with no string formatting
-"""
-    logger.info(f"Sending query: {query}")
-    response = send_and_get_response(cc, query)
-    logger.info(f"Response: {json.load(response)}")
-
-
-# prompt: 
-"""
-Control: Infrastructure and Virtualization Security Policy and Procedures
-Statement: Establish, document, approve, communicate, apply, evaluate and maintain
-policies and procedures for infrastructure and virtualization security. Review
-and update the policies and procedures at least annually.
-
-
-The information above is for a "cloud control," which is a type of security measure taken to solve certain issues relating to cloud security. A user is alerted with a security risk relating to the control above, and wants to ask an LLM for help. Create a single question and answer relating to the control above and this statement: Governance and control VM lifecycle management. give response in json format, and both the question and answer should be simple such as a paragraph with no string formatting
-"""
+    df = td.create_dataset(None, cc)
+    df.to_xml(args.fname, index=True)
